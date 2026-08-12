@@ -7,8 +7,8 @@ the USB cable, so the phone reaches the queue without any server, domain or TLS.
     python test_local.py 9744802942
 
 Then in SimBridge on the phone set:
-    Queue URL  http://127.0.0.1:8000/next
-    Token      test-token-local-only
+    Queue URL     http://127.0.0.1:8777/next
+    Your number   test-token-local-only   (the number IS the login token now)
 and tap "Save & start". Re-run this script to place another call.
 """
 import os

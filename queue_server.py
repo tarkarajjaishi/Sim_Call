@@ -61,12 +61,44 @@ ARRIVED = threading.Event()
 RESULTS = {}
 _IDS = itertools.count(1)
 
+# The token is now the phone's own number -- short and public -- so brute force is
+# the real threat. Lock an IP out after too many bad tokens in a window. Not a
+# substitute for a strong token, but it turns "crack in minutes" into "never".
+FAILS = {}                       # ip -> (count, window_start)
+FAIL_MAX = int(os.environ.get("QUEUE_FAIL_MAX", "15"))
+FAIL_WINDOW = 60.0
+
+
+def _throttled(ip):
+    count, start = FAILS.get(ip, (0, 0.0))
+    return time.time() - start <= FAIL_WINDOW and count >= FAIL_MAX
+
+
+def _record_fail(ip):
+    now = time.time()
+    count, start = FAILS.get(ip, (0, now))
+    if now - start > FAIL_WINDOW:
+        count, start = 0, now
+    FAILS[ip] = (count + 1, start)
+
 
 class Handler(BaseHTTPRequestHandler):
     def _authed(self):
         got = self.headers.get("Authorization", "")
         # compare_digest, not ==, so the token can't be guessed a byte at a time.
         return got.startswith("Bearer ") and secrets.compare_digest(got[7:], TOKEN)
+
+    def _ok(self):
+        """Authenticate with brute-force lockout. Returns True if the request may proceed."""
+        ip = self.client_address[0]
+        if _throttled(ip):
+            self._send(429, b"too many attempts")
+            return False
+        if self._authed():
+            return True
+        _record_fail(ip)
+        self._send(401, b"bad token")
+        return False
 
     def _send(self, code, body=b""):
         self.send_response(code)
@@ -76,8 +108,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if not self._authed():
-            return self._send(401, b"bad token")
+        if not self._ok():
+            return
         if self.path == "/results":
             return self._send(200, json.dumps(RESULTS).encode())
         if self.path != "/next":
@@ -98,8 +130,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(taken).encode())
 
     def do_POST(self):
-        if not self._authed():
-            return self._send(401, b"bad token")
+        if not self._ok():
+            return
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         if self.path == "/result":
             try:
@@ -254,6 +286,15 @@ def _test():
     assert next_job()["to"] == "5551234"
     assert time.monotonic() - t0 < 5, "woke on timeout, not on the enqueue"
     HOLD = 0.2
+
+    # brute-force lockout: after FAIL_MAX bad tokens from an IP, even the correct
+    # token is refused with 429. Runs last -- it locks out 127.0.0.1 for the window.
+    FAILS.clear()
+    for _ in range(FAIL_MAX):
+        assert err(get, "/next", "guess") == 401
+    assert err(get, "/next", "guess") == 429            # attacker locked out
+    assert err(get, "/next") == 429                     # and so is the real token now
+    FAILS.clear()
 
     srv.shutdown()
     print("ok")

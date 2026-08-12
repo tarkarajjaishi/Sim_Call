@@ -44,8 +44,7 @@ import java.net.URL
 const val TAG = "SimBridge"
 private const val PREFS = "simbridge"
 private const val K_URL = "url"
-private const val K_TOKEN = "token"
-private const val K_FROM = "from"
+private const val K_FROM = "from"   // the SIM number: doubles as caller AND login token
 
 private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -102,7 +101,6 @@ fun subIdFor(c: Context, pick: String): Int {
 
 class MainActivity : Activity() {
     private lateinit var url: EditText
-    private lateinit var token: EditText
     private lateinit var from: EditText
 
     override fun onCreate(b: Bundle?) {
@@ -120,19 +118,14 @@ class MainActivity : Activity() {
             setText(p.getString(K_URL, ""))
             setSingleLine()
         }
-        token = EditText(this).apply {
-            hint = "QUEUE_TOKEN from the VPS"
-            setText(p.getString(K_TOKEN, ""))
-            setSingleLine()
-        }
         from = EditText(this).apply {
-            hint = "your number, or carrier name"
+            hint = "your SIM's number, e.g. 98XXXXXXXX"
             setText(p.getString(K_FROM, ""))
             setSingleLine()
         }
         root.addView(label("Queue URL")); root.addView(url)
-        root.addView(label("Token")); root.addView(token)
-        root.addView(label("Call from")); root.addView(from)
+        root.addView(label("Your number (calls from this SIM, and is your login)"))
+        root.addView(from)
         root.addView(TextView(this).apply {
             text = "Detected: " + (sims(this@MainActivity)
                 .joinToString("; ") {
@@ -164,24 +157,22 @@ class MainActivity : Activity() {
 
     private fun saveAndStart() {
         val u = url.text.toString().trim()
-        val t = token.text.toString().trim()
         val f = from.text.toString().trim()
-        // The token is sent on every request; over plain HTTP anyone on the path
-        // can lift it and drive your SIM. Refuse rather than warn. Loopback is the
-        // one safe exception -- it never leaves the device (use `adb reverse`).
+        // The number is sent as the bearer token on every request; over plain HTTP
+        // anyone on the path can lift it and drive your SIM. Refuse rather than
+        // warn. Loopback is the one safe exception (use `adb reverse`).
         val loopback = u.startsWith("http://127.0.0.1") || u.startsWith("http://localhost")
         if (!u.startsWith("https://") && !loopback) {
             return toast("URL must be https:// (or http://127.0.0.1 for local testing)")
         }
-        if (t.isEmpty()) return toast("Token required")
-        // Fail loudly here rather than silently dialling from the wrong SIM later.
-        if (f.isNotEmpty() && subIdFor(this, f) == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-            return toast("No SIM matches \"$f\" - use a number or carrier name shown above")
-        }
-        prefs(this).edit()
-            .putString(K_URL, u).putString(K_TOKEN, t).putString(K_FROM, f).apply()
+        if (f.isEmpty()) return toast("Your number is required -- it is your login")
+        // Soft-check: if no SIM matches, the login still works but calls fall back
+        // to the phone's default SIM. Tell them so it isn't a silent surprise.
+        val matched = subIdFor(this, f) != SubscriptionManager.INVALID_SUBSCRIPTION_ID
+        prefs(this).edit().putString(K_URL, u).putString(K_FROM, f).apply()
         startForegroundService(Intent(this, PollService::class.java))
-        toast(if (f.isEmpty()) "Running (phone default SIM)" else "Running (from $f)")
+        toast(if (matched) "Running -- calling from this SIM"
+              else "Running, but no SIM matched that number; using default SIM")
     }
 
     /**
@@ -189,7 +180,7 @@ class MainActivity : Activity() {
      * shell user so `input tap`/`input text` cannot fill these fields:
      *
      *   adb shell am start -n com.tarka.simbridge/.MainActivity \
-     *       --es url http://127.0.0.1:8777/next --es token TOKEN --es from Ncell
+     *       --es url http://127.0.0.1:8777/next --es number 9744802942
      *   adb shell am start -n com.tarka.simbridge/.MainActivity --es action stop
      *
      * Gated on the debuggable flag so a release build can't be driven by any
@@ -202,10 +193,9 @@ class MainActivity : Activity() {
             return toast("Stopped")
         }
         val u = intent?.getStringExtra("url") ?: return
-        val t = intent?.getStringExtra("token") ?: return
+        val n = intent?.getStringExtra("number") ?: return
         url.setText(u)
-        token.setText(t)
-        intent?.getStringExtra("from")?.let { from.setText(it) }
+        from.setText(n)
         saveAndStart()
     }
 
@@ -254,8 +244,8 @@ class PollService : Service() {
     private fun loop() {
         val p = prefs(this)
         val url = p.getString(K_URL, "").orEmpty()
-        val token = p.getString(K_TOKEN, "").orEmpty()
         defaultFrom = p.getString(K_FROM, "").orEmpty()
+        val token = defaultFrom     // the number authenticates AND selects the SIM
         while (running) {
             // A failed *poll* and a failed *job* are different things: the first
             // means back off and retry, the second means report it and move on.
