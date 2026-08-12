@@ -3,11 +3,12 @@ package com.tarka.simbridge
 // SimBridge: one app for both calls and SMS.
 //
 //   VPS queue_server.py  <──long-poll GET /next──  PollService  ──> SIM
+//                        ──POST /result──────────>
 //
 // The phone only ever makes outbound connections, so nothing needs to reach it.
-// Jobs are {"type":"call"|"sms","to":...,"sim":N,"seconds":N|"text":...}
+// Jobs are {"id":N,"type":"call"|"sms","to":...,"sim":N,"seconds":N|"text":...}
 
-import android.Manifest
+import android.accessibilityservice.AccessibilityService
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Notification
@@ -22,11 +23,15 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telephony.SmsManager
+import android.telephony.SubscriptionInfo
 import android.telephony.SubscriptionManager
 import android.util.Log
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -40,23 +45,65 @@ const val TAG = "SimBridge"
 private const val PREFS = "simbridge"
 private const val K_URL = "url"
 private const val K_TOKEN = "token"
+private const val K_FROM = "from"
 
 private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
 private val NEEDED: Array<String>
     get() = mutableListOf(
-        Manifest.permission.CALL_PHONE,
-        Manifest.permission.SEND_SMS,
-        Manifest.permission.READ_PHONE_STATE,
-        Manifest.permission.ANSWER_PHONE_CALLS,
+        android.Manifest.permission.CALL_PHONE,
+        android.Manifest.permission.SEND_SMS,
+        android.Manifest.permission.READ_PHONE_STATE,
+        android.Manifest.permission.ANSWER_PHONE_CALLS,
     ).also {
-        if (Build.VERSION.SDK_INT >= 33) it.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (Build.VERSION.SDK_INT >= 26) it.add(android.Manifest.permission.READ_PHONE_NUMBERS)
+        if (Build.VERSION.SDK_INT >= 33) it.add(android.Manifest.permission.POST_NOTIFICATIONS)
     }.toTypedArray()
+
+/** Active SIMs, or empty if the permission isn't granted yet. */
+@SuppressLint("MissingPermission")
+fun sims(c: Context): List<SubscriptionInfo> = try {
+    c.getSystemService(SubscriptionManager::class.java).activeSubscriptionInfoList.orEmpty()
+} catch (e: SecurityException) {
+    emptyList()
+}
+
+/**
+ * Resolve whatever the user typed in "Call from" to a subscriptionId.
+ * Accepts the SIM's own number, the carrier name ("Ncell"), or a slot number.
+ * Numbers are matched on their last 9 digits because carriers format the
+ * stored MSISDN inconsistently (+977…, 977…, or bare).
+ */
+fun subIdFor(c: Context, pick: String): Int {
+    val p = pick.trim()
+    val invalid = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+    if (p.isEmpty() || p == "0") return invalid
+    val list = sims(c)
+
+    val digits = p.filter { it.isDigit() }
+    if (digits.length >= 6) {
+        val tail = digits.takeLast(9)
+        list.firstOrNull { s ->
+            s.number?.filter { it.isDigit() }?.takeLast(9) == tail
+        }?.let { return it.subscriptionId }
+    }
+    list.firstOrNull {
+        it.displayName?.toString().equals(p, true) ||
+            it.carrierName?.toString().equals(p, true)
+    }?.let { return it.subscriptionId }
+    p.toIntOrNull()?.let { n ->
+        list.firstOrNull { it.simSlotIndex == n - 1 }?.let { return it.subscriptionId }
+    }
+    // Don't log p itself -- it's the owner's own phone number.
+    Log.w(TAG, "no SIM matched the configured \"call from\"; using phone default")
+    return invalid
+}
 
 
 class MainActivity : Activity() {
     private lateinit var url: EditText
     private lateinit var token: EditText
+    private lateinit var from: EditText
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -78,8 +125,22 @@ class MainActivity : Activity() {
             setText(p.getString(K_TOKEN, ""))
             setSingleLine()
         }
+        from = EditText(this).apply {
+            hint = "your number, or carrier name"
+            setText(p.getString(K_FROM, ""))
+            setSingleLine()
+        }
         root.addView(label("Queue URL")); root.addView(url)
         root.addView(label("Token")); root.addView(token)
+        root.addView(label("Call from")); root.addView(from)
+        root.addView(TextView(this).apply {
+            text = "Detected: " + (sims(this@MainActivity)
+                .joinToString("; ") {
+                    "slot ${it.simSlotIndex + 1} ${it.displayName}" +
+                        (it.number?.takeIf(String::isNotBlank)?.let { n -> " ($n)" } ?: "")
+                }.ifEmpty { "no SIMs yet - grant Phone permission" })
+            setPadding(0, pad / 2, 0, 0)
+        })
         root.addView(Button(this).apply {
             text = "Save & start"
             setOnClickListener { saveAndStart() }
@@ -92,12 +153,35 @@ class MainActivity : Activity() {
             }
         })
         root.addView(label(
-            "Grant Phone and SMS permissions when asked, then set this app to " +
-            "Unrestricted under Settings > Apps > Battery, or Android will kill it."))
+            "Runs until you tap Stop, including with the screen off. Set this app " +
+            "to Unrestricted under Settings > Apps > Battery, and enable SimBridge " +
+            "under Settings > Accessibility so calls hang up automatically."))
         setContentView(root, ViewGroup.LayoutParams(-1, -1))
 
         requestPermissions(NEEDED, 1)
         configureFromIntent()
+    }
+
+    private fun saveAndStart() {
+        val u = url.text.toString().trim()
+        val t = token.text.toString().trim()
+        val f = from.text.toString().trim()
+        // The token is sent on every request; over plain HTTP anyone on the path
+        // can lift it and drive your SIM. Refuse rather than warn. Loopback is the
+        // one safe exception -- it never leaves the device (use `adb reverse`).
+        val loopback = u.startsWith("http://127.0.0.1") || u.startsWith("http://localhost")
+        if (!u.startsWith("https://") && !loopback) {
+            return toast("URL must be https:// (or http://127.0.0.1 for local testing)")
+        }
+        if (t.isEmpty()) return toast("Token required")
+        // Fail loudly here rather than silently dialling from the wrong SIM later.
+        if (f.isNotEmpty() && subIdFor(this, f) == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+            return toast("No SIM matches \"$f\" - use a number or carrier name shown above")
+        }
+        prefs(this).edit()
+            .putString(K_URL, u).putString(K_TOKEN, t).putString(K_FROM, f).apply()
+        startForegroundService(Intent(this, PollService::class.java))
+        toast(if (f.isEmpty()) "Running (phone default SIM)" else "Running (from $f)")
     }
 
     /**
@@ -105,7 +189,7 @@ class MainActivity : Activity() {
      * shell user so `input tap`/`input text` cannot fill these fields:
      *
      *   adb shell am start -n com.tarka.simbridge/.MainActivity \
-     *       --es url http://127.0.0.1:8777/next --es token TOKEN
+     *       --es url http://127.0.0.1:8777/next --es token TOKEN --es from Ncell
      *   adb shell am start -n com.tarka.simbridge/.MainActivity --es action stop
      *
      * Gated on the debuggable flag so a release build can't be driven by any
@@ -121,23 +205,8 @@ class MainActivity : Activity() {
         val t = intent?.getStringExtra("token") ?: return
         url.setText(u)
         token.setText(t)
+        intent?.getStringExtra("from")?.let { from.setText(it) }
         saveAndStart()
-    }
-
-    private fun saveAndStart() {
-        val u = url.text.toString().trim()
-        val t = token.text.toString().trim()
-        // The token is sent on every request; over plain HTTP anyone on the path
-        // can lift it and drive your SIM. Refuse rather than warn. Loopback is the
-        // one safe exception -- it never leaves the device (use `adb reverse`).
-        val loopback = u.startsWith("http://127.0.0.1") || u.startsWith("http://localhost")
-        if (!u.startsWith("https://") && !loopback) {
-            return toast("URL must be https:// (or http://127.0.0.1 for local testing)")
-        }
-        if (t.isEmpty()) return toast("Token required")
-        prefs(this).edit().putString(K_URL, u).putString(K_TOKEN, t).apply()
-        startForegroundService(Intent(this, PollService::class.java))
-        toast("Running")
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
@@ -146,13 +215,14 @@ class MainActivity : Activity() {
 
 class PollService : Service() {
     @Volatile private var running = false
+    private var defaultFrom = ""
 
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onStartCommand(i: Intent?, flags: Int, id: Int): Int {
         if (!running) {
             running = true
-            startForeground(1, notification("waiting for jobs"))
+            startForeground(1, notification())
             Thread(::loop, "simbridge-poll").start()
         }
         return START_STICKY
@@ -162,27 +232,30 @@ class PollService : Service() {
         running = false
     }
 
-    private fun notification(text: String): Notification {
+    /**
+     * Android requires a foreground service to post a notification -- there is no
+     * way to hide it, and dropping it means the OS (MIUI especially) kills the
+     * service. IMPORTANCE_MIN is as quiet as it gets: silent, no status-bar icon,
+     * parked at the bottom of the shade.
+     */
+    private fun notification(): Notification {
         val ch = "simbridge"
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(ch, "SimBridge", NotificationManager.IMPORTANCE_LOW))
+            NotificationChannel(ch, "SimBridge", NotificationManager.IMPORTANCE_MIN)
+                .apply { setShowBadge(false) })
         return Notification.Builder(this, ch)
             .setContentTitle("SimBridge")
-            .setContentText(text)
+            .setContentText("Running until you tap Stop")
             .setSmallIcon(android.R.drawable.sym_action_call)
             .setOngoing(true)
             .build()
     }
 
-    private fun status(text: String) {
-        getSystemService(NotificationManager::class.java).notify(1, notification(text))
-    }
-
-    @Suppress("DEPRECATION")
     private fun loop() {
         val p = prefs(this)
         val url = p.getString(K_URL, "").orEmpty()
         val token = p.getString(K_TOKEN, "").orEmpty()
+        defaultFrom = p.getString(K_FROM, "").orEmpty()
         while (running) {
             // A failed *poll* and a failed *job* are different things: the first
             // means back off and retry, the second means report it and move on.
@@ -192,7 +265,6 @@ class PollService : Service() {
                 JSONObject(body)
             } catch (e: Exception) {
                 Log.w(TAG, "poll failed: ${e.message}")
-                status("retrying: ${e.message}")
                 Thread.sleep(5_000)
                 continue
             }
@@ -202,10 +274,10 @@ class PollService : Service() {
             } catch (e: Exception) {
                 error = e.toString()
                 Log.w(TAG, "job ${job.optInt("id")} failed: $e")
-                status("failed: ${e.message}")
             }
             report(url, token, job.optInt("id", 0), error)
         }
+        @Suppress("DEPRECATION")
         stopForeground(true)
     }
 
@@ -247,75 +319,141 @@ class PollService : Service() {
 
     private fun handle(job: JSONObject) {
         val to = job.getString("to")
-        val sim = job.optInt("sim", 0)
+        // Per-job "sim" wins; otherwise the number/carrier configured in the app.
+        val pick = job.optString("sim", "").ifEmpty { defaultFrom }
+        val subId = subIdFor(this, pick)
         when (job.getString("type")) {
-            "call" -> { status("calling $to"); call(to, sim, job.optInt("seconds", 45)) }
-            "sms" -> { status("texting $to"); sms(to, job.getString("text"), sim) }
+            "call" -> call(to, subId, job.optInt("seconds", 45))
+            "sms" -> sms(to, job.getString("text"), subId)
             else -> Log.w(TAG, "unknown job type in $job")
         }
-        status("waiting for jobs")
     }
 
     @SuppressLint("MissingPermission")
-    private fun call(to: String, sim: Int, seconds: Int) {
+    private fun call(to: String, subId: Int, seconds: Int) {
         val i = Intent(Intent.ACTION_CALL, Uri.fromParts("tel", to, null))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        phoneAccount(sim)?.let { i.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it) }
+        phoneAccount(subId)?.let { i.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it) }
         startActivity(i)
         Thread.sleep(seconds * 1000L)
         hangUp()
     }
 
+    /**
+     * Match the phone account by subscriptionId rather than by list position --
+     * callCapablePhoneAccounts is not ordered by slot, so indexing it picks the
+     * wrong SIM. Telecom registers each account with id == subId.
+     */
     @SuppressLint("MissingPermission")
-    private fun phoneAccount(sim: Int) = try {
-        if (sim <= 0) null
-        else getSystemService(TelecomManager::class.java)
-            .callCapablePhoneAccounts.getOrNull(sim - 1)
-    } catch (e: SecurityException) {
-        Log.w(TAG, "cannot list phone accounts: ${e.message}"); null
-    }
-
-    @Suppress("DEPRECATION")
-    @SuppressLint("MissingPermission")
-    private fun hangUp() {
-        if (Build.VERSION.SDK_INT < 28) return    // no endCall API before Android 9
-        val ended = try {
-            getSystemService(TelecomManager::class.java).endCall()
+    private fun phoneAccount(subId: Int): PhoneAccountHandle? {
+        if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) return null
+        return try {
+            getSystemService(TelecomManager::class.java)
+                .callCapablePhoneAccounts.firstOrNull { it.id == subId.toString() }
+                .also { if (it == null) Log.w(TAG, "no phone account for subId $subId") }
         } catch (e: SecurityException) {
-            false
+            Log.w(TAG, "cannot list phone accounts: ${e.message}"); null
         }
-        // ponytail: Android 10+ may restrict endCall to the default phone app. If
-        // this logs, the fix is to request the dialer role -- not more retries.
-        if (!ended) Log.w(TAG, "endCall refused; set SimBridge as the default phone app")
+    }
+
+    private fun hangUp() {
+        // 1. The proper API. Android 10+ refuses it unless we're the default phone
+        //    app, which would mean taking over every call on the device.
+        if (Build.VERSION.SDK_INT >= 28) {
+            @Suppress("DEPRECATION") @SuppressLint("MissingPermission")
+            val ended = try {
+                getSystemService(TelecomManager::class.java).endCall()
+            } catch (e: SecurityException) {
+                false
+            }
+            if (ended) return
+        }
+        // 2. Fallback: the accessibility service presses End for us. Enabled once,
+        //    then fully automatic -- no interaction per call.
+        if (HangupService.instance?.endCall() == true) return
+        Log.w(TAG, "could not end call -- enable SimBridge under Settings > Accessibility")
     }
 
     @SuppressLint("MissingPermission")
-    private fun sms(to: String, text: String, sim: Int) {
-        val m = smsManager(sim)
+    private fun sms(to: String, text: String, subId: Int) {
+        val m = smsManager(subId)
         // divideMessage handles >160 chars; sendTextMessage would silently truncate.
         m.sendMultipartTextMessage(to, null, m.divideMessage(text), null, null)
     }
 
     @Suppress("DEPRECATION")
-    private fun smsManager(sim: Int): SmsManager {
+    private fun smsManager(subId: Int): SmsManager {
         val base = if (Build.VERSION.SDK_INT >= 31) getSystemService(SmsManager::class.java)
                    else SmsManager.getDefault()
-        val id = subId(sim)
-        if (id == SubscriptionManager.INVALID_SUBSCRIPTION_ID) return base
-        return if (Build.VERSION.SDK_INT >= 31) base.createForSubscriptionId(id)
-               else SmsManager.getSmsManagerForSubscriptionId(id)
+        if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) return base
+        return if (Build.VERSION.SDK_INT >= 31) base.createForSubscriptionId(subId)
+               else SmsManager.getSmsManagerForSubscriptionId(subId)
+    }
+}
+
+
+/**
+ * Ends calls by pressing the dialer's End button. Needed because endCall() is
+ * restricted to the default phone app, and becoming the default phone app would
+ * route every personal call through this app too.
+ *
+ * Enable once: Settings > Accessibility > Downloaded apps > SimBridge.
+ */
+class HangupService : AccessibilityService() {
+    companion object {
+        @Volatile
+        var instance: HangupService? = null
     }
 
-    @SuppressLint("MissingPermission")
-    private fun subId(sim: Int): Int {
-        if (sim <= 0) return SubscriptionManager.INVALID_SUBSCRIPTION_ID
-        return try {
-            getSystemService(SubscriptionManager::class.java)
-                .activeSubscriptionInfoList?.getOrNull(sim - 1)?.subscriptionId
-                ?: SubscriptionManager.INVALID_SUBSCRIPTION_ID
-        } catch (e: SecurityException) {
-            SubscriptionManager.INVALID_SUBSCRIPTION_ID
+    override fun onServiceConnected() {
+        instance = this
+        Log.i(TAG, "hangup service connected")
+    }
+
+    override fun onDestroy() {
+        instance = null
+        super.onDestroy()
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onInterrupt() {}
+
+    fun endCall(): Boolean {
+        val root = rootInActiveWindow ?: run {
+            Log.w(TAG, "hangup: no active window"); return false
         }
+        val node = find(root)
+        if (node == null) {
+            Log.w(TAG, "hangup: no End button found")
+            // Dumping node text can capture whatever is on screen, so only do it
+            // in debug builds -- it exists to identify this vendor's dialer ids.
+            if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+                dump(root, 0)
+            }
+            return false
+        }
+        val clicked = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        Log.i(TAG, "hangup: clicked ${node.viewIdResourceName} -> $clicked")
+        return clicked
+    }
+
+    private fun find(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (n == null) return null
+        val id = n.viewIdResourceName.orEmpty()
+        val desc = n.contentDescription?.toString().orEmpty()
+        val matches = id.contains("end", true) || id.contains("hang", true) ||
+            desc.contains("end call", true) || desc.contains("hang up", true)
+        if (matches && n.isClickable) return n
+        for (i in 0 until n.childCount) find(n.getChild(i))?.let { return it }
+        return null
+    }
+
+    private fun dump(n: AccessibilityNodeInfo?, depth: Int) {
+        if (n == null || depth > 12) return
+        if (n.isClickable) {
+            Log.i(TAG, "  node id=${n.viewIdResourceName} desc=${n.contentDescription} text=${n.text}")
+        }
+        for (i in 0 until n.childCount) dump(n.getChild(i), depth + 1)
     }
 }
 

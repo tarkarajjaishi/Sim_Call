@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_description">Lets SimBridge end a call automatically when the configured duration is reached. Android restricts hanging up to the default phone app, so this is the only way to do it without replacing your dialer.</string>
+</resources>

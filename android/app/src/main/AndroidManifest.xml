@@ -3,16 +3,22 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
-    <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
     <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- SEND_SMS is a RESTRICTED permission. Declaring it is what makes Android
+         show the "sensitive permission" warning; that warning cannot be turned
+         off. Delete this one line to build a calls-only app with no warning. -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@android:drawable/sym_action_call"
         android:label="SimBridge"
         android:networkSecurityConfig="@xml/network_security_config">
@@ -33,6 +39,20 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Bridges the owner's own call and SMS queue to this device" />
+        </service>
+
+        <!-- Only way to hang up without becoming the default phone app. Reads the
+             in-call window to find the End button; nothing is sent anywhere. -->
+        <service
+            android:name=".HangupService"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
         </service>
 
         <receiver
