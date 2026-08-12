@@ -452,47 +452,82 @@ class HangupService : AccessibilityService() {
         super.onDestroy()
     }
 
-    // When a new window appears mid-call, it may be MIUI's "Choose SIM for this
-    // call" dialog. If one of our calls is in flight, tap the row for its SIM.
+    // When a window appears/changes mid-call, it may be MIUI's "Choose SIM for
+    // this call" dialog. If one of our calls is in flight, tap the row for its SIM.
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val type = event?.eventType ?: return
+        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
         val pick = wantSim ?: return
         val root = rootInActiveWindow ?: return
         if (!isSimChooser(root)) return
         val row = findSimRow(root, pick)
         if (row == null) {
-            Log.w(TAG, "SIM chooser is up but no row matched the configured SIM")
+            Log.w(TAG, "SIM chooser detected but no row matched \"$pick\"")
+            if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) dumpTree(root, 0)
             return
         }
-        Log.i(TAG, "auto-tapping SIM row -> ${row.performAction(AccessibilityNodeInfo.ACTION_CLICK)}")
+        // The matching node may itself not be clickable (text sits in a child of a
+        // clickable row) -- click the nearest clickable ancestor.
+        val target = clickableSelfOrAncestor(row) ?: row
+        Log.i(TAG, "auto-tapping SIM row (${target.viewIdResourceName}) -> " +
+            "${target.performAction(AccessibilityNodeInfo.ACTION_CLICK)}")
     }
 
     override fun onInterrupt() {}
 
     private fun isSimChooser(root: AccessibilityNodeInfo?): Boolean {
+        // Detect by the dialer's SIM-picker view ids (robust to wording/locale)
+        // or the visible prompt text.
+        if (hasId(root, "account") || hasId(root, "select_phone_account")) return true
         val t = subtreeText(root).lowercase()
         return "choose sim" in t || "select sim" in t ||
             "sim for this call" in t || "which sim" in t
     }
 
-    /** The clickable row whose text carries the wanted SIM's number or carrier. */
+    /** Any node whose subtree carries the wanted SIM's number or carrier name. */
     private fun findSimRow(node: AccessibilityNodeInfo?, pick: String): AccessibilityNodeInfo? {
         val wantDigits = pick.filter { it.isDigit() }.takeLast(9)
-        return findClickable(node) { text ->
+        val wantName = pick.trim()
+        return findNode(node) { n ->
+            val text = subtreeText(n)
             val d = text.filter { it.isDigit() }
-            (wantDigits.length >= 6 && wantDigits in d) || pick.trim().let {
-                it.isNotEmpty() && text.contains(it, ignoreCase = true) && !it.all(Char::isDigit)
-            }
+            (wantDigits.length >= 6 && wantDigits in d) ||
+                (wantName.isNotEmpty() && !wantName.all(Char::isDigit) &&
+                    text.contains(wantName, ignoreCase = true))
         }
     }
 
-    private fun findClickable(
-        node: AccessibilityNodeInfo?, matches: (String) -> Boolean
+    private fun findNode(
+        node: AccessibilityNodeInfo?, matches: (AccessibilityNodeInfo) -> Boolean
     ): AccessibilityNodeInfo? {
         if (node == null) return null
-        if (node.isClickable && matches(subtreeText(node))) return node
-        for (i in 0 until node.childCount) findClickable(node.getChild(i), matches)?.let { return it }
+        // Prefer the deepest matching node so we get the row, not the whole dialog.
+        for (i in 0 until node.childCount) findNode(node.getChild(i), matches)?.let { return it }
+        return if (matches(node)) node else null
+    }
+
+    private fun clickableSelfOrAncestor(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        var n = node
+        while (n != null) {
+            if (n.isClickable) return n
+            n = n.parent
+        }
         return null
+    }
+
+    private fun hasId(node: AccessibilityNodeInfo?, needle: String): Boolean {
+        if (node == null) return false
+        if (node.viewIdResourceName?.contains(needle, ignoreCase = true) == true) return true
+        for (i in 0 until node.childCount) if (hasId(node.getChild(i), needle)) return true
+        return false
+    }
+
+    private fun dumpTree(n: AccessibilityNodeInfo?, depth: Int) {
+        if (n == null || depth > 14) return
+        Log.i(TAG, "  ".repeat(depth) +
+            "id=${n.viewIdResourceName} clk=${n.isClickable} text=${n.text} desc=${n.contentDescription}")
+        for (i in 0 until n.childCount) dumpTree(n.getChild(i), depth + 1)
     }
 
     private fun subtreeText(node: AccessibilityNodeInfo?): String {

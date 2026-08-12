@@ -15,11 +15,24 @@ android {
         versionName = "1.0"
     }
 
+    signingConfigs {
+        // Override the auto-generated debug key with a committed keystore so every
+        // build shares one signature. That lets `install -r` / a Downloads update
+        // replace the app in place, keeping permissions, the accessibility grant
+        // and config -- instead of the uninstall-per-build churn a random CI key
+        // causes. It's a debug key for a personal sideload; the password is the
+        // stock Android debug value on purpose.
+        getByName("debug") {
+            storeFile = file("simbridge.jks")
+            storePassword = "android"
+            keyAlias = "simbridge"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Sideloaded, so sign release with the debug key too -- otherwise the
-            // APK is unsigned and Android refuses to install it.
             signingConfig = signingConfigs.getByName("debug")
         }
     }
