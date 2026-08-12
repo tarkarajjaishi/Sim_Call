@@ -46,6 +46,12 @@ private const val PREFS = "simbridge"
 private const val K_URL = "url"
 private const val K_FROM = "from"   // the SIM number: doubles as caller AND login token
 
+// Hanging up is worth more than one look at the screen -- see hangUp(). Short
+// and few: this runs after the call has already had its full talk time, so
+// every retry is line time being paid for.
+private const val HANGUP_TRIES = 5
+private const val HANGUP_RETRY_MS = 700L
+
 private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
 private val NEEDED: Array<String>
@@ -242,11 +248,15 @@ class PollService : Service() {
     }
 
     private fun loop() {
-        val p = prefs(this)
-        val url = p.getString(K_URL, "").orEmpty()
-        defaultFrom = p.getString(K_FROM, "").orEmpty()
-        val token = defaultFrom     // the number authenticates AND selects the SIM
         while (running) {
+            // Re-read prefs every iteration so tapping "Save & start" with a new
+            // number takes effect on the next poll -- without this, a running
+            // service keeps using whatever it started with and ignores edits.
+            val p = prefs(this)
+            val url = p.getString(K_URL, "").orEmpty()
+            defaultFrom = p.getString(K_FROM, "").orEmpty()
+            val token = defaultFrom     // the number authenticates AND selects the SIM
+            if (url.isEmpty() || token.isEmpty()) { Thread.sleep(2_000); continue }
             // A failed *poll* and a failed *job* are different things: the first
             // means back off and retry, the second means report it and move on.
             val job = try {
@@ -326,7 +336,18 @@ class PollService : Service() {
         phoneAccount(subId)?.let { i.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it) }
         startActivity(i)
         Thread.sleep(seconds * 1000L)
-        hangUp()
+        // A call we cannot end is not a job that went well. It stays up, holding
+        // the one line this phone has, until the network eventually drops it --
+        // and reporting ok for that is how the server ends up believing the
+        // queue is healthy while every call since the first failure is still
+        // ringing. The dial itself worked, so the message says so; the outcome
+        // is a failure because something has to be done about it.
+        if (!hangUp()) {
+            throw IllegalStateException(
+                "called $to but could not end the call -- the line is still open. " +
+                    "Enable SimBridge under Settings > Accessibility."
+            )
+        }
     }
 
     /**
@@ -346,7 +367,8 @@ class PollService : Service() {
         }
     }
 
-    private fun hangUp() {
+    /** True when the call was actually ended. The caller must not assume it was. */
+    private fun hangUp(): Boolean {
         // 1. The proper API. Android 10+ refuses it unless we're the default phone
         //    app, which would mean taking over every call on the device.
         if (Build.VERSION.SDK_INT >= 28) {
@@ -356,12 +378,22 @@ class PollService : Service() {
             } catch (e: SecurityException) {
                 false
             }
-            if (ended) return
+            if (ended) return true
         }
         // 2. Fallback: the accessibility service presses End for us. Enabled once,
         //    then fully automatic -- no interaction per call.
-        if (HangupService.instance?.endCall() == true) return
+        //
+        // Retried, because the first attempt can land while the dialer is mid
+        // transition and there is no End button in the tree yet: an in-call
+        // screen still animating, or a vendor dialer that rebuilds its controls
+        // when the call connects. Giving up on one look turned a timing wobble
+        // into a call nobody hung up.
+        repeat(HANGUP_TRIES) { attempt ->
+            if (HangupService.instance?.endCall() == true) return true
+            if (attempt < HANGUP_TRIES - 1) Thread.sleep(HANGUP_RETRY_MS)
+        }
         Log.w(TAG, "could not end call -- enable SimBridge under Settings > Accessibility")
+        return false
     }
 
     @SuppressLint("MissingPermission")
