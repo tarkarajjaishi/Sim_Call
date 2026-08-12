@@ -11,6 +11,7 @@ Then in SimBridge on the phone set:
     Token      test-token-local-only
 and tap "Save & start". Re-run this script to place another call.
 """
+import os
 import subprocess
 import sys
 import threading
@@ -21,7 +22,7 @@ import queue_server as q
 from sim import _adb_exe
 
 TOKEN = "test-token-local-only"   # local loopback only; never used off-device
-PORT = 8000
+PORT = int(os.environ.get("QUEUE_PORT", "8777"))  # 8000 is often taken (uvicorn etc.)
 
 
 def main():
