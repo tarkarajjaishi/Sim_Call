@@ -23,6 +23,7 @@ Enqueue from your own Python:
 """
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -30,10 +31,20 @@ import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from sim import _tel  # same number validation both halves use
+
+def _tel(number):
+    """Normalise and validate a phone number. Raises ValueError on anything else."""
+    n = re.sub(r"[^\d+]", "", str(number))
+    if not re.fullmatch(r"\+?\d{4,15}", n):
+        raise ValueError(f"bad number: {number!r}")
+    return n
 
 TOKEN = os.environ.get("QUEUE_TOKEN", "")
 PORT = int(os.environ.get("QUEUE_PORT", "8000"))
+# Localhost by default: TLS is terminated by the reverse proxy in front. Binding
+# 0.0.0.0 would expose the bearer token over plain HTTP to anyone who port-scans
+# the VPS. Override only if you genuinely terminate TLS elsewhere.
+BIND = os.environ.get("QUEUE_BIND", "127.0.0.1")
 BASE = os.environ.get("QUEUE_URL", f"http://127.0.0.1:{PORT}")
 HOLD = float(os.environ.get("QUEUE_HOLD", "25"))  # long-poll: seconds to hold an empty GET
 
@@ -162,6 +173,15 @@ def _test():
         assert code == 200
         return json.loads(body) if body else None
 
+    assert _tel("+91 98765 43210") == "+919876543210"   # normalises
+    assert _tel("(987) 654-3210") == "9876543210"
+    for bad in ("", "abc", "123", "9" * 20, "12+34"):
+        try:
+            _tel(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"should have rejected {bad!r}")
+
     assert err(get, "/next", "wrong-token") == 401      # bad token refused on read
     assert err(get, "/nope") == 404
     assert next_job() is None                           # empty queue -> empty body
@@ -199,5 +219,5 @@ if __name__ == "__main__":
     elif not TOKEN:
         sys.exit('set QUEUE_TOKEN first:\n  export QUEUE_TOKEN=$(python3 -c "import secrets;print(secrets.token_urlsafe(24))")')
     else:
-        print(f"listening on :{PORT}", file=sys.stderr)
-        ThreadingHTTPServer(("", PORT), Handler).serve_forever()
+        print(f"listening on {BIND}:{PORT}", file=sys.stderr)
+        ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

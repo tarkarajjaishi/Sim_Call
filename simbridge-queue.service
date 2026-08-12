@@ -1,0 +1,33 @@
+# systemd unit so the queue survives reboots and crashes.
+#   sudo cp simbridge-queue.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now simbridge-queue
+#   systemctl status simbridge-queue
+#
+# Generate the token once and put it in /etc/simbridge.env as:
+#   QUEUE_TOKEN=<paste>
+#   sudo chmod 600 /etc/simbridge.env
+
+[Unit]
+Description=SimBridge call/SMS queue
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/simbridge.env
+ExecStart=/usr/bin/python3 /opt/simbridge/queue_server.py
+Restart=always
+RestartSec=5
+
+# Bound to localhost only -- Caddy terminates TLS and proxies in. Never expose
+# :8000 directly; the bearer token would then travel in the clear.
+Environment=QUEUE_PORT=8000
+User=simbridge
+Group=simbridge
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

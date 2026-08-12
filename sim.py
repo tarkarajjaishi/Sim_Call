@@ -35,11 +35,7 @@ USER = os.environ.get("SMSGATE_USER", "")
 PASSWORD = os.environ.get("SMSGATE_PASS", "")
 
 
-def _tel(number):
-    n = re.sub(r"[^\d+]", "", str(number))
-    if not re.fullmatch(r"\+?\d{4,15}", n):
-        raise ValueError(f"bad number: {number!r}")
-    return n
+from queue_server import _tel  # noqa: E402  (single source of truth for numbers)
 
 
 # ---------------------------------------------------------------- SMS (wifi)
