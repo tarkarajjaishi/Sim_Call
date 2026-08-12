@@ -21,12 +21,14 @@ Enqueue from your own Python:
     from queue_server import enqueue
     enqueue("9876543210")
 """
+import itertools
 import json
 import os
 import re
 import secrets
 import sys
 import threading
+import time
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +55,12 @@ HOLD = float(os.environ.get("QUEUE_HOLD", "25"))  # long-poll: seconds to hold a
 QUEUE = deque()
 ARRIVED = threading.Event()
 
+# id -> {"job":..., "ok":bool, "error":str, "at":epoch}. Without this a job that
+# the phone accepts but cannot execute (revoked permission, no signal) vanishes
+# silently and the queue just looks drained.
+RESULTS = {}
+_IDS = itertools.count(1)
+
 
 class Handler(BaseHTTPRequestHandler):
     def _authed(self):
@@ -70,6 +78,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._authed():
             return self._send(401, b"bad token")
+        if self.path == "/results":
+            return self._send(200, json.dumps(RESULTS).encode())
         if self.path != "/next":
             return self._send(404)
         # Long-poll: hold an empty request open instead of answering "nothing yet".
@@ -79,17 +89,29 @@ class Handler(BaseHTTPRequestHandler):
             ARRIVED.wait(HOLD)
             ARRIVED.clear()
         try:
-            job = json.dumps(QUEUE.popleft())  # popleft is atomic; another poller
+            taken = QUEUE.popleft()            # popleft is atomic; another poller
         except IndexError:                     # may have taken it between the two
-            job = ""
-        self._send(200, job.encode())
+            return self._send(200, b"")
+        # Mark it dispatched now. If the phone never reports back, this row stays
+        # ok=None, which is how you spot a phone that died mid-job.
+        RESULTS[taken["id"]] = {"job": taken, "ok": None, "error": "", "at": time.time()}
+        self._send(200, json.dumps(taken).encode())
 
     def do_POST(self):
         if not self._authed():
             return self._send(401, b"bad token")
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+        if self.path == "/result":
+            try:
+                r = json.loads(raw)
+                row = RESULTS.setdefault(int(r["id"]), {"job": None, "at": time.time()})
+                row["ok"] = bool(r["ok"])
+                row["error"] = str(r.get("error", ""))
+            except (ValueError, TypeError, KeyError) as e:
+                return self._send(400, f"{type(e).__name__}: {e}".encode())
+            return self._send(200, b"recorded")
         if self.path != "/enqueue":
             return self._send(404)
-        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         try:
             QUEUE.append(_job(json.loads(raw)))
         except (ValueError, TypeError, KeyError) as e:
@@ -106,7 +128,7 @@ def _job(d):
     kind = d["type"]
     if kind not in ("call", "sms"):
         raise ValueError(f"unknown type: {kind!r}")
-    job = {"type": kind, "to": _tel(d["to"]), "sim": int(d.get("sim", 0))}
+    job = {"id": next(_IDS), "type": kind, "to": _tel(d["to"]), "sim": int(d.get("sim", 0))}
     if kind == "sms":
         text = str(d["text"])
         if not text:
@@ -135,6 +157,16 @@ def enqueue_call(number, seconds=45, sim=0, base=None):
 def enqueue_sms(number, text, sim=0, base=None):
     """Queue an SMS. Long text is split into parts by the app."""
     return _post({"type": "sms", "to": str(number), "text": text, "sim": sim}, base)
+
+
+def results(base=None):
+    """Outcome of every dispatched job. ok=True done, False failed, None no reply."""
+    req = urllib.request.Request(
+        (base or BASE).rstrip("/") + "/results",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
 
 
 def _test():
@@ -197,9 +229,23 @@ def _test():
 
     assert enqueue_call("+91 98765 43210", seconds=30, sim=2, base=base) == 200
     assert enqueue_sms("9876543211", "hello there", base=base) == 200
-    assert next_job() == {"type": "call", "to": "+919876543210", "sim": 2, "seconds": 30}
-    assert next_job() == {"type": "sms", "to": "9876543211", "sim": 0, "text": "hello there"}
+    a, b = next_job(), next_job()
+    assert {k: v for k, v in a.items() if k != "id"} == \
+        {"type": "call", "to": "+919876543210", "sim": 2, "seconds": 30}
+    assert {k: v for k, v in b.items() if k != "id"} == \
+        {"type": "sms", "to": "9876543211", "sim": 0, "text": "hello there"}
     assert next_job() is None                           # drained, FIFO order held
+
+    # dispatched-but-unreported reads as ok=None -- that's how a dead phone shows
+    assert RESULTS[a["id"]]["ok"] is None
+    assert post("/result", json.dumps({"id": a["id"], "ok": True}))[0] == 200
+    assert post("/result", json.dumps(
+        {"id": b["id"], "ok": False, "error": "revoked permission CALL_PHONE"}))[0] == 200
+    got = results(base)
+    assert got[str(a["id"])]["ok"] is True
+    assert got[str(b["id"])]["ok"] is False
+    assert "CALL_PHONE" in got[str(b["id"])]["error"]
+    assert err(post, "/result", '{"id":1}') == 400      # malformed result refused
 
     # long-poll: a GET parked on an empty queue must wake on enqueue, not time out
     HOLD = 10

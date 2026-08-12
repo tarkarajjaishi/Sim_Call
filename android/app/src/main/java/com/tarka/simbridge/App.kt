@@ -184,15 +184,27 @@ class PollService : Service() {
         val url = p.getString(K_URL, "").orEmpty()
         val token = p.getString(K_TOKEN, "").orEmpty()
         while (running) {
-            try {
+            // A failed *poll* and a failed *job* are different things: the first
+            // means back off and retry, the second means report it and move on.
+            val job = try {
                 val body = fetch(url, token)
-                if (body.isNotEmpty()) handle(JSONObject(body))
+                if (body.isEmpty()) continue
+                JSONObject(body)
             } catch (e: Exception) {
-                // Network blips and VPS restarts are normal; back off and retry.
                 Log.w(TAG, "poll failed: ${e.message}")
                 status("retrying: ${e.message}")
                 Thread.sleep(5_000)
+                continue
             }
+            var error: String? = null
+            try {
+                handle(job)
+            } catch (e: Exception) {
+                error = e.toString()
+                Log.w(TAG, "job ${job.optInt("id")} failed: $e")
+                status("failed: ${e.message}")
+            }
+            report(url, token, job.optInt("id", 0), error)
         }
         stopForeground(true)
     }
@@ -205,6 +217,29 @@ class PollService : Service() {
             c.readTimeout = 45_000        // must exceed the server's 25s long-poll hold
             if (c.responseCode != 200) throw Exception("HTTP ${c.responseCode}")
             return c.inputStream.bufferedReader().readText().trim()
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    /** Tell the server what happened, so a job the phone cannot run isn't silent. */
+    private fun report(url: String, token: String, id: Int, error: String?) {
+        val target = url.removeSuffix("/next") + "/result"
+        val body = JSONObject()
+            .put("id", id).put("ok", error == null).put("error", error ?: "")
+            .toString()
+        val c = URL(target).openConnection() as HttpURLConnection
+        try {
+            c.requestMethod = "POST"
+            c.doOutput = true
+            c.connectTimeout = 15_000
+            c.readTimeout = 15_000
+            c.setRequestProperty("Authorization", "Bearer $token")
+            c.setRequestProperty("Content-Type", "application/json")
+            c.outputStream.use { it.write(body.toByteArray()) }
+            if (c.responseCode != 200) Log.w(TAG, "report -> HTTP ${c.responseCode}")
+        } catch (e: Exception) {
+            Log.w(TAG, "report failed: ${e.message}")
         } finally {
             c.disconnect()
         }
