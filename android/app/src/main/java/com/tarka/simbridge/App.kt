@@ -11,9 +11,11 @@ package com.tarka.simbridge
 import android.accessibilityservice.AccessibilityService
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -23,6 +25,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.SystemClock
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telephony.SmsManager
@@ -45,6 +48,7 @@ const val TAG = "SimBridge"
 private const val PREFS = "simbridge"
 private const val K_URL = "url"
 private const val K_FROM = "from"   // the SIM number: doubles as caller AND login token
+private const val K_ENABLED = "enabled"   // user's intent: keep running until Stop is tapped
 
 // Hanging up is worth more than one look at the screen -- see hangUp(). Short
 // and few: this runs after the call has already had its full talk time, so
@@ -53,6 +57,35 @@ private const val HANGUP_TRIES = 5
 private const val HANGUP_RETRY_MS = 700L
 
 private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+// --- 24/7 watchdog ---------------------------------------------------------
+// The service must survive OS memory-kills and the app being swiped from
+// recents, and come back on boot -- but ONLY while the user wants it (they
+// tapped Save & start and haven't tapped Stop). K_ENABLED is that intent; a
+// repeating inexact alarm resurrects the service if it ever dies. Force-stop
+// still wins (Android disables an app's alarms/receivers until it is launched
+// again by hand) -- that limit is unavoidable without root.
+
+private fun watchdogIntent(c: Context): PendingIntent {
+    return PendingIntent.getBroadcast(
+        c, 0, Intent(c, RestartReceiver::class.java),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+}
+
+private fun startBridge(c: Context) {
+    prefs(c).edit().putBoolean(K_ENABLED, true).apply()
+    c.startForegroundService(Intent(c, PollService::class.java))
+    c.getSystemService(AlarmManager::class.java).setInexactRepeating(
+        AlarmManager.ELAPSED_REALTIME,
+        SystemClock.elapsedRealtime() + 60_000L,
+        15 * 60_000L, watchdogIntent(c))
+}
+
+private fun stopBridge(c: Context) {
+    prefs(c).edit().putBoolean(K_ENABLED, false).apply()
+    c.getSystemService(AlarmManager::class.java).cancel(watchdogIntent(c))
+    c.stopService(Intent(c, PollService::class.java))
+}
 
 private val NEEDED: Array<String>
     get() = mutableListOf(
@@ -147,7 +180,7 @@ class MainActivity : Activity() {
         root.addView(Button(this).apply {
             text = "Stop"
             setOnClickListener {
-                stopService(Intent(this@MainActivity, PollService::class.java))
+                stopBridge(this@MainActivity)   // the only thing that ends 24/7 mode
                 Toast.makeText(this@MainActivity, "Stopped", Toast.LENGTH_SHORT).show()
             }
         })
@@ -176,8 +209,8 @@ class MainActivity : Activity() {
         // to the phone's default SIM. Tell them so it isn't a silent surprise.
         val matched = subIdFor(this, f) != SubscriptionManager.INVALID_SUBSCRIPTION_ID
         prefs(this).edit().putString(K_URL, u).putString(K_FROM, f).apply()
-        startForegroundService(Intent(this, PollService::class.java))
-        toast(if (matched) "Running -- calling from this SIM"
+        startBridge(this)   // runs 24/7 with a watchdog until Stop is tapped
+        toast(if (matched) "Running 24/7 -- calling from this SIM"
               else "Running, but no SIM matched that number; using default SIM")
     }
 
@@ -226,22 +259,36 @@ class PollService : Service() {
 
     override fun onDestroy() {
         running = false
+        // If the user didn't tap Stop, resurrect immediately (covers OS kills that
+        // route through onDestroy). The alarm watchdog is the slower backstop.
+        if (prefs(this).getBoolean(K_ENABLED, false)) {
+            startForegroundService(Intent(this, PollService::class.java))
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // App swiped out of recents -- not a Stop. Come back.
+        if (prefs(this).getBoolean(K_ENABLED, false)) {
+            startForegroundService(Intent(this, PollService::class.java))
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     /**
-     * Android requires a foreground service to post a notification -- there is no
-     * way to hide it, and dropping it means the OS (MIUI especially) kills the
-     * service. IMPORTANCE_MIN is as quiet as it gets: silent, no status-bar icon,
-     * parked at the bottom of the shade.
+     * Android requires a foreground service to post a notification -- it cannot be
+     * removed programmatically, and dropping it makes the OS kill the service.
+     * IMPORTANCE_MIN is the quietest allowed: silent, no status-bar icon, parked
+     * at the bottom of the shade -- and a MIN channel the USER can switch off in
+     * notification settings to hide it entirely while the service keeps running.
      */
     private fun notification(): Notification {
         val ch = "simbridge"
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(ch, "SimBridge", NotificationManager.IMPORTANCE_MIN)
+            NotificationChannel(ch, "SimBridge status", NotificationManager.IMPORTANCE_MIN)
                 .apply { setShowBadge(false) })
         return Notification.Builder(this, ch)
             .setContentTitle("SimBridge")
-            .setContentText("Running until you tap Stop")
+            .setContentText("On — runs until you tap Stop")
             .setSmallIcon(android.R.drawable.sym_action_call)
             .setOngoing(true)
             .build()
@@ -585,7 +632,19 @@ class HangupService : AccessibilityService() {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         if (i.action != Intent.ACTION_BOOT_COMPLETED) return
-        if (prefs(c).getString(K_URL, "").isNullOrEmpty()) return
+        if (!prefs(c).getBoolean(K_ENABLED, false)) return   // only if not Stopped
+        startBridge(c)   // restart + re-arm the watchdog
+    }
+}
+
+/**
+ * The watchdog's hands: fired by the repeating alarm (and re-fired after a
+ * memory-kill). Brings the service back if the user hasn't tapped Stop. A no-op
+ * when already running -- onStartCommand guards on that.
+ */
+class RestartReceiver : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        if (!prefs(c).getBoolean(K_ENABLED, false)) return
         c.startForegroundService(Intent(c, PollService::class.java))
     }
 }
