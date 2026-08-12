@@ -17,6 +17,7 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -96,6 +97,31 @@ class MainActivity : Activity() {
         setContentView(root, ViewGroup.LayoutParams(-1, -1))
 
         requestPermissions(NEEDED, 1)
+        configureFromIntent()
+    }
+
+    /**
+     * Debug-only headless setup, because MIUI revokes INJECT_EVENTS from the adb
+     * shell user so `input tap`/`input text` cannot fill these fields:
+     *
+     *   adb shell am start -n com.tarka.simbridge/.MainActivity \
+     *       --es url http://127.0.0.1:8777/next --es token TOKEN
+     *   adb shell am start -n com.tarka.simbridge/.MainActivity --es action stop
+     *
+     * Gated on the debuggable flag so a release build can't be driven by any
+     * other app on the device sending this exported activity an intent.
+     */
+    private fun configureFromIntent() {
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
+        if (intent?.getStringExtra("action") == "stop") {
+            stopService(Intent(this, PollService::class.java))
+            return toast("Stopped")
+        }
+        val u = intent?.getStringExtra("url") ?: return
+        val t = intent?.getStringExtra("token") ?: return
+        url.setText(u)
+        token.setText(t)
+        saveAndStart()
     }
 
     private fun saveAndStart() {
