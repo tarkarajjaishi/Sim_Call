@@ -102,9 +102,11 @@ class MainActivity : Activity() {
         val u = url.text.toString().trim()
         val t = token.text.toString().trim()
         // The token is sent on every request; over plain HTTP anyone on the path
-        // can lift it and drive your SIM. Refuse rather than warn.
-        if (!u.startsWith("https://")) {
-            return toast("URL must start with https:// -- the token is sent with every poll")
+        // can lift it and drive your SIM. Refuse rather than warn. Loopback is the
+        // one safe exception -- it never leaves the device (use `adb reverse`).
+        val loopback = u.startsWith("http://127.0.0.1") || u.startsWith("http://localhost")
+        if (!u.startsWith("https://") && !loopback) {
+            return toast("URL must be https:// (or http://127.0.0.1 for local testing)")
         }
         if (t.isEmpty()) return toast("Token required")
         prefs(this).edit().putString(K_URL, u).putString(K_TOKEN, t).apply()

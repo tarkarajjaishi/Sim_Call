@@ -21,10 +21,11 @@ run call_poller.sh under Termux on the phone instead (see that file).
 usage: python sim.py call NUM [SECONDS] | sms NUM TEXT | test
 """
 import base64
+import glob
 import json
 import os
-import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -62,10 +63,23 @@ def sms(number, text, sim=None):
 
 # ---------------------------------------------------------------- CALL (usb)
 
+def _adb_exe():
+    """adb isn't on PATH after `winget install Google.PlatformTools`."""
+    found = shutil.which("adb")
+    if found:
+        return found
+    pattern = r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Google.PlatformTools_*\platform-tools\adb.exe"
+    hits = glob.glob(os.path.expandvars(pattern))
+    if not hits:
+        sys.exit("adb not found -- run: winget install Google.PlatformTools")
+    return hits[0]
+
+
 def _adb(*args):
     # Quote for the *device's* shell -- adb concatenates argv and re-parses it there.
     cmd = " ".join(shlex.quote(a) for a in args)
-    return subprocess.run(["adb", "shell", cmd], capture_output=True, text=True, check=True).stdout
+    r = subprocess.run([_adb_exe(), "shell", cmd], capture_output=True, text=True, check=True)
+    return r.stdout
 
 
 def call(number, seconds=None):
