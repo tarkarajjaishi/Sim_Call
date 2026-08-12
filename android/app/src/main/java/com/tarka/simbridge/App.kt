@@ -319,8 +319,11 @@ class PollService : Service() {
 
     private fun handle(job: JSONObject) {
         val to = job.getString("to")
-        // Per-job "sim" wins; otherwise the number/carrier configured in the app.
-        val pick = job.optString("sim", "").ifEmpty { defaultFrom }
+        // Per-job "sim" wins; but the server always sends sim:0 to mean "default",
+        // and optString turns that into the literal "0" -- which matches no SIM.
+        // So treat blank/"0" as "use the number configured in the app".
+        val raw = job.optString("sim", "")
+        val pick = if (raw.isBlank() || raw == "0") defaultFrom else raw
         val subId = subIdFor(this, pick)
         when (job.getString("type")) {
             "call" -> call(to, subId, pick, job.optInt("seconds", 45))
