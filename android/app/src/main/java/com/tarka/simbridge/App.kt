@@ -323,30 +323,39 @@ class PollService : Service() {
         val pick = job.optString("sim", "").ifEmpty { defaultFrom }
         val subId = subIdFor(this, pick)
         when (job.getString("type")) {
-            "call" -> call(to, subId, job.optInt("seconds", 45))
+            "call" -> call(to, subId, pick, job.optInt("seconds", 45))
             "sms" -> sms(to, job.getString("text"), subId)
             else -> Log.w(TAG, "unknown job type in $job")
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun call(to: String, subId: Int, seconds: Int) {
-        val i = Intent(Intent.ACTION_CALL, Uri.fromParts("tel", to, null))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        phoneAccount(subId)?.let { i.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it) }
-        startActivity(i)
-        Thread.sleep(seconds * 1000L)
-        // A call we cannot end is not a job that went well. It stays up, holding
-        // the one line this phone has, until the network eventually drops it --
-        // and reporting ok for that is how the server ends up believing the
-        // queue is healthy while every call since the first failure is still
-        // ringing. The dial itself worked, so the message says so; the outcome
-        // is a failure because something has to be done about it.
-        if (!hangUp()) {
-            throw IllegalStateException(
-                "called $to but could not end the call -- the line is still open. " +
-                    "Enable SimBridge under Settings > Accessibility."
-            )
+    private fun call(to: String, subId: Int, pick: String, seconds: Int) {
+        // Tell the accessibility service which SIM this call wants, so if MIUI pops
+        // "Choose SIM for this call" (it does when no system default is set), it
+        // auto-taps the right row instead of stalling. Cleared when the call ends,
+        // so personal calls the user makes are left alone.
+        HangupService.wantSim = pick.ifEmpty { null }
+        try {
+            val i = Intent(Intent.ACTION_CALL, Uri.fromParts("tel", to, null))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            phoneAccount(subId)?.let { i.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it) }
+            startActivity(i)
+            Thread.sleep(seconds * 1000L)
+            // A call we cannot end is not a job that went well. It stays up, holding
+            // the one line this phone has, until the network eventually drops it --
+            // and reporting ok for that is how the server ends up believing the
+            // queue is healthy while every call since the first failure is still
+            // ringing. The dial itself worked, so the message says so; the outcome
+            // is a failure because something has to be done about it.
+            if (!hangUp()) {
+                throw IllegalStateException(
+                    "called $to but could not end the call -- the line is still open. " +
+                        "Enable SimBridge under Settings > Accessibility."
+                )
+            }
+        } finally {
+            HangupService.wantSim = null   // leave personal calls alone once we're done
         }
     }
 
@@ -425,6 +434,12 @@ class HangupService : AccessibilityService() {
     companion object {
         @Volatile
         var instance: HangupService? = null
+
+        // The SIM the in-flight SimBridge call wants (number or carrier). Set by
+        // PollService around each dial, null otherwise -- so the picker auto-tap
+        // only fires for our calls, never for the user's own manual ones.
+        @Volatile
+        var wantSim: String? = null
     }
 
     override fun onServiceConnected() {
@@ -437,8 +452,57 @@ class HangupService : AccessibilityService() {
         super.onDestroy()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    // When a new window appears mid-call, it may be MIUI's "Choose SIM for this
+    // call" dialog. If one of our calls is in flight, tap the row for its SIM.
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val pick = wantSim ?: return
+        val root = rootInActiveWindow ?: return
+        if (!isSimChooser(root)) return
+        val row = findSimRow(root, pick)
+        if (row == null) {
+            Log.w(TAG, "SIM chooser is up but no row matched the configured SIM")
+            return
+        }
+        Log.i(TAG, "auto-tapping SIM row -> ${row.performAction(AccessibilityNodeInfo.ACTION_CLICK)}")
+    }
+
     override fun onInterrupt() {}
+
+    private fun isSimChooser(root: AccessibilityNodeInfo?): Boolean {
+        val t = subtreeText(root).lowercase()
+        return "choose sim" in t || "select sim" in t ||
+            "sim for this call" in t || "which sim" in t
+    }
+
+    /** The clickable row whose text carries the wanted SIM's number or carrier. */
+    private fun findSimRow(node: AccessibilityNodeInfo?, pick: String): AccessibilityNodeInfo? {
+        val wantDigits = pick.filter { it.isDigit() }.takeLast(9)
+        return findClickable(node) { text ->
+            val d = text.filter { it.isDigit() }
+            (wantDigits.length >= 6 && wantDigits in d) || pick.trim().let {
+                it.isNotEmpty() && text.contains(it, ignoreCase = true) && !it.all(Char::isDigit)
+            }
+        }
+    }
+
+    private fun findClickable(
+        node: AccessibilityNodeInfo?, matches: (String) -> Boolean
+    ): AccessibilityNodeInfo? {
+        if (node == null) return null
+        if (node.isClickable && matches(subtreeText(node))) return node
+        for (i in 0 until node.childCount) findClickable(node.getChild(i), matches)?.let { return it }
+        return null
+    }
+
+    private fun subtreeText(node: AccessibilityNodeInfo?): String {
+        if (node == null) return ""
+        val sb = StringBuilder()
+        node.text?.let { sb.append(it).append(' ') }
+        node.contentDescription?.let { sb.append(it).append(' ') }
+        for (i in 0 until node.childCount) sb.append(subtreeText(node.getChild(i)))
+        return sb.toString()
+    }
 
     fun endCall(): Boolean {
         val root = rootInActiveWindow ?: run {
